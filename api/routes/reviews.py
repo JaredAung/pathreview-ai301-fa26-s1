@@ -7,8 +7,10 @@ from api.middleware.auth import get_current_user
 from api.schemas.review import ReviewCreate, ReviewListResponse, ReviewResponse
 from core.database import get_db
 from core.models.user import User
+from core.services.profile_service import get_profile
 from core.services.review_service import (
     create_review,
+    find_cached_review,
     get_review,
     list_reviews,
     process_review,
@@ -32,6 +34,19 @@ async def create_review_endpoint(
     Returns review with status="pending" immediately.
     """
     try:
+        # Return the stored review when the profile is unchanged since it completed
+        profile = await get_profile(db=db, profile_id=data.profile_id, user_id=current_user.id)
+        if profile:
+            cached = await find_cached_review(db, profile)
+            if cached:
+                log.info(
+                    "review_cache_hit",
+                    review_id=str(cached.id),
+                    profile_id=str(data.profile_id),
+                    user_id=str(current_user.id),
+                )
+                return ReviewResponse.model_validate(cached)
+
         # Create review with status="pending"
         review = await create_review(
             db=db,

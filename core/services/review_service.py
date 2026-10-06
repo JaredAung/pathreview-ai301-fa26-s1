@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import datetime
 from uuid import UUID
@@ -195,6 +196,105 @@ async def process_review(
             log.error("review_status_update_failed", review_id=str(review_id), error=str(e))
 
 
+def _source_payloads(profile: Profile) -> list[tuple[str, dict]]:
+    """
+    Build the (source_type, payload) pairs ingestion reads from a profile.
+    Shared by ingestion and the review cache so both hash the same bytes.
+    """
+    payloads: list[tuple[str, dict]] = []
+
+    if profile.github_username:
+        # Placeholder: actual GitHub ingestion logic
+        payloads.append(
+            (
+                "github",
+                {
+                    "source_type": "github",
+                    "username": profile.github_username,
+                    "data": f"GitHub profile data for {profile.github_username}",
+                },
+            )
+        )
+
+    if profile.portfolio_url:
+        # Placeholder: actual portfolio ingestion logic
+        payloads.append(
+            (
+                "portfolio",
+                {
+                    "source_type": "portfolio",
+                    "url": profile.portfolio_url,
+                    "data": f"Portfolio data from {profile.portfolio_url}",
+                },
+            )
+        )
+
+    if profile.resume_text:
+        payloads.append(
+            (
+                "resume",
+                {
+                    "source_type": "resume",
+                    "filename": profile.resume_filename,
+                    "data": profile.resume_text,
+                },
+            )
+        )
+
+    return payloads
+
+
+def _hash_raw_data(raw_data: str) -> str:
+    """SHA256 hex digest of a source payload serialized as JSON."""
+    return hashlib.sha256(raw_data.encode("utf-8")).hexdigest()
+
+
+def profile_source_hashes(profile: Profile) -> dict[str, str]:
+    """
+    Return {source_type: sha256} for each source the profile currently has.
+    A field the profile does not have is omitted.
+    """
+    return {
+        source_type: _hash_raw_data(json.dumps(payload))
+        for source_type, payload in _source_payloads(profile)
+    }
+
+
+async def find_cached_review(db, profile: Profile) -> Review | None:
+    """
+    Return the latest completed review for a profile whose ingested sources
+    still match the profile's current content, or None on a miss.
+    A miss is any changed hash, any null stored hash, any stored source type
+    the profile no longer has, or no completed review.
+    """
+    current = profile_source_hashes(profile)
+    if not current:
+        return None
+
+    stmt = (
+        select(IngestedSource)
+        .where(IngestedSource.profile_id == profile.id)
+        .order_by(IngestedSource.ingested_at.desc())
+    )
+    result = await db.execute(stmt)
+    latest_stored: dict[str, str | None] = {}
+    for source in result.scalars().all():
+        latest_stored.setdefault(source.source_type, source.content_hash)
+
+    if set(latest_stored) != set(current):
+        return None
+    if any(latest_stored[source_type] != h for source_type, h in current.items()):
+        return None
+
+    stmt = (
+        select(Review)
+        .where(and_(Review.profile_id == profile.id, Review.status == "complete"))
+        .order_by(Review.created_at.desc())
+    )
+    result = await db.execute(stmt)
+    return result.scalars().first()
+
+
 async def _run_ingestion_pipeline(db, profile: Profile) -> list[dict]:
     """
     Run ingestion pipeline to extract data from profile sources.
@@ -202,77 +302,20 @@ async def _run_ingestion_pipeline(db, profile: Profile) -> list[dict]:
     """
     sources = []
 
-    # Ingest from GitHub if available
-    if profile.github_username:
+    for source_type, payload in _source_payloads(profile):
         try:
-            # Placeholder: actual GitHub ingestion logic
-            github_data = {
-                "source_type": "github",
-                "username": profile.github_username,
-                "data": f"GitHub profile data for {profile.github_username}",
-            }
-            sources.append(github_data)
+            sources.append(payload)
 
             # Store in database
             ingested = IngestedSource(
                 profile_id=profile.id,
-                source_type="github",
-                raw_data=json.dumps(github_data),
+                source_type=source_type,
+                content_hash=_hash_raw_data(json.dumps(payload)),
             )
             db.add(ingested)
         except Exception as exc:
             log.error(
-                "github_ingestion_failed",
-                username=profile.github_username,
-                error=str(exc),
-            )
-
-    # Ingest from portfolio URL if available
-    if profile.portfolio_url:
-        try:
-            # Placeholder: actual portfolio ingestion logic
-            portfolio_data = {
-                "source_type": "portfolio",
-                "url": profile.portfolio_url,
-                "data": f"Portfolio data from {profile.portfolio_url}",
-            }
-            sources.append(portfolio_data)
-
-            # Store in database
-            ingested = IngestedSource(
-                profile_id=profile.id,
-                source_type="portfolio",
-                raw_data=json.dumps(portfolio_data),
-            )
-            db.add(ingested)
-        except Exception as exc:
-            log.error(
-                "portfolio_ingestion_failed",
-                url=profile.portfolio_url,
-                error=str(exc),
-            )
-
-    # Ingest from resume if available
-    if profile.resume_text:
-        try:
-            resume_data = {
-                "source_type": "resume",
-                "filename": profile.resume_filename,
-                "data": profile.resume_text,
-            }
-            sources.append(resume_data)
-
-            # Store in database
-            ingested = IngestedSource(
-                profile_id=profile.id,
-                source_type="resume",
-                raw_data=json.dumps(resume_data),
-            )
-            db.add(ingested)
-        except Exception as exc:
-            log.error(
-                "resume_ingestion_failed",
-                filename=profile.resume_filename,
+                f"{source_type}_ingestion_failed",
                 error=str(exc),
             )
 

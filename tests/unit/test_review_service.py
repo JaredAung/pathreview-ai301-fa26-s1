@@ -7,8 +7,10 @@ import pytest
 
 from core.services.review_service import (
     create_review,
+    find_cached_review,
     get_review,
     list_reviews,
+    profile_source_hashes,
 )
 
 
@@ -377,3 +379,80 @@ class TestReviewService:
 
         # Should order by created_at descending
         mock_db_session.execute.assert_called_once()
+
+
+@pytest.mark.unit
+class TestReviewCache:
+    """Issue #9: an unchanged profile returns its stored review."""
+
+    @staticmethod
+    def _profile(portfolio_url="https://example.com"):
+        profile = Mock()
+        profile.id = uuid4()
+        profile.github_username = "octocat"
+        profile.portfolio_url = portfolio_url
+        profile.resume_text = None
+        profile.resume_filename = None
+        return profile
+
+    @staticmethod
+    def _result(items):
+        result = Mock()
+        result.scalars.return_value.all.return_value = items
+        result.scalars.return_value.first.return_value = items[0] if items else None
+        return result
+
+    @staticmethod
+    def _source(source_type, content_hash):
+        source = Mock()
+        source.source_type = source_type
+        source.content_hash = content_hash
+        return source
+
+    def test_hashes_omit_missing_resume(self):
+        hashes = profile_source_hashes(self._profile())
+        assert set(hashes) == {"github", "portfolio"}
+
+    def test_changed_portfolio_url_changes_only_its_hash(self):
+        before = profile_source_hashes(self._profile())
+        after = profile_source_hashes(self._profile("https://example.org"))
+        assert before["github"] == after["github"]
+        assert before["portfolio"] != after["portfolio"]
+
+    @pytest.mark.asyncio
+    async def test_matching_hashes_return_completed_review(self):
+        profile = self._profile()
+        hashes = profile_source_hashes(profile)
+        sources = [self._source(t, h) for t, h in hashes.items()]
+        complete = Mock(status="complete")
+        db = AsyncMock()
+        db.execute.side_effect = [self._result(sources), self._result([complete])]
+
+        assert await find_cached_review(db, profile) is complete
+
+    @pytest.mark.asyncio
+    async def test_changed_portfolio_url_misses(self):
+        stored = self._profile()
+        sources = [self._source(t, h) for t, h in profile_source_hashes(stored).items()]
+        db = AsyncMock()
+        db.execute.side_effect = [self._result(sources), self._result([Mock(status="complete")])]
+
+        assert await find_cached_review(db, self._profile("https://example.org")) is None
+
+    @pytest.mark.asyncio
+    async def test_null_stored_hash_misses(self):
+        profile = self._profile()
+        sources = [self._source(t, None) for t in profile_source_hashes(profile)]
+        db = AsyncMock()
+        db.execute.side_effect = [self._result(sources), self._result([Mock(status="complete")])]
+
+        assert await find_cached_review(db, profile) is None
+
+    @pytest.mark.asyncio
+    async def test_no_completed_review_misses(self):
+        profile = self._profile()
+        sources = [self._source(t, h) for t, h in profile_source_hashes(profile).items()]
+        db = AsyncMock()
+        db.execute.side_effect = [self._result(sources), self._result([])]
+
+        assert await find_cached_review(db, profile) is None
